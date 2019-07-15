@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/ecies"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -77,30 +76,36 @@ func NewEnvelope(ttl uint32, topic TopicType, msg *sentMessage) *Envelope {
 // Seal closes the envelope by spending the requested amount of time as a proof
 // of work on hashing the data.
 func (e *Envelope) Seal(options *MessageParams) error {
-	var target, bestBit int
 	if options.PoW == 0 {
-		// adjust for the duration of Seal() execution only if execution time is predefined unconditionally
+		// PoW is not required
+		return nil
+	}
+
+	var target, bestLeadingZeros int
+	if options.PoW < 0 {
+		// target is not set - the function should run for a period
+		// of time specified in WorkTime param. Since we can predict
+		// the execution time, we can also adjust Expiry.
 		e.Expiry += options.WorkTime
 	} else {
 		target = e.powToFirstBit(options.PoW)
-		if target < 1 {
-			target = 1
-		}
 	}
 
-	buf := make([]byte, 64)
-	h := crypto.Keccak256(e.rlpWithoutNonce())
-	copy(buf[:32], h)
+	rlp := e.rlpWithoutNonce()
+	buf := make([]byte, len(rlp)+8)
+	copy(buf, rlp)
+	asAnInt := new(big.Int)
 
 	finish := time.Now().Add(time.Duration(options.WorkTime) * time.Second).UnixNano()
 	for nonce := uint64(0); time.Now().UnixNano() < finish; {
 		for i := 0; i < 1024; i++ {
-			binary.BigEndian.PutUint64(buf[56:], nonce)
-			d := new(big.Int).SetBytes(crypto.Keccak256(buf))
-			firstBit := math.FirstBitSet(d)
-			if firstBit > bestBit {
-				e.Nonce, bestBit = nonce, firstBit
-				if target > 0 && bestBit >= target {
+			binary.BigEndian.PutUint64(buf[len(rlp):], nonce)
+			h := crypto.Keccak256(buf)
+			asAnInt.SetBytes(h)
+			leadingZeros := 256 - asAnInt.BitLen()
+			if leadingZeros > bestLeadingZeros {
+				e.Nonce, bestLeadingZeros = nonce, leadingZeros
+				if target > 0 && bestLeadingZeros >= target {
 					return nil
 				}
 			}
@@ -108,13 +113,15 @@ func (e *Envelope) Seal(options *MessageParams) error {
 		}
 	}
 
-	if target > 0 && bestBit < target {
+	if target > 0 && bestLeadingZeros < target {
 		return fmt.Errorf("failed to reach the PoW target, specified pow time (%d seconds) was insufficient", options.WorkTime)
 	}
 
 	return nil
 }
 
+// PoW computes (if necessary) and returns the proof of work target
+// of the envelope.
 func (e *Envelope) PoW() float64 {
 	if e.pow == 0 {
 		e.calculatePoW(0)
@@ -123,14 +130,14 @@ func (e *Envelope) PoW() float64 {
 }
 
 func (e *Envelope) calculatePoW(diff uint32) {
-	buf := make([]byte, 64)
-	h := crypto.Keccak256(e.rlpWithoutNonce())
-	copy(buf[:32], h)
-	binary.BigEndian.PutUint64(buf[56:], e.Nonce)
-	d := new(big.Int).SetBytes(crypto.Keccak256(buf))
-	firstBit := math.FirstBitSet(d)
-	x := gmath.Pow(2, float64(firstBit))
-	x /= float64(e.size())
+	rlp := e.rlpWithoutNonce()
+	buf := make([]byte, len(rlp)+8)
+	copy(buf, rlp)
+	binary.BigEndian.PutUint64(buf[len(rlp):], e.Nonce)
+	powHash := new(big.Int).SetBytes(crypto.Keccak256(buf))
+	leadingZeroes := 256 - powHash.BitLen()
+	x := gmath.Pow(2, float64(leadingZeroes))
+	x /= float64(len(rlp))
 	x /= float64(e.TTL + diff)
 	e.pow = x
 }
@@ -141,7 +148,11 @@ func (e *Envelope) powToFirstBit(pow float64) int {
 	x *= float64(e.TTL)
 	bits := gmath.Log2(x)
 	bits = gmath.Ceil(bits)
-	return int(bits)
+	res := int(bits)
+	if res < 1 {
+		res = 1
+	}
+	return res
 }
 
 // Hash returns the SHA3 hash of the envelope, calculating it if not yet done.
@@ -198,8 +209,11 @@ func (e *Envelope) OpenSymmetric(key []byte) (msg *ReceivedMessage, err error) {
 
 // Open tries to decrypt an envelope, and populates the message fields in case of success.
 func (e *Envelope) Open(watcher *Filter) (msg *ReceivedMessage) {
-	// The API interface forbids filters doing both symmetric and
-	// asymmetric encryption.
+	if watcher == nil {
+		return nil
+	}
+
+	// The API interface forbids filters doing both symmetric and asymmetric encryption.
 	if watcher.expectsAsymmetricEncryption() && watcher.expectsSymmetricEncryption() {
 		return nil
 	}
@@ -217,7 +231,7 @@ func (e *Envelope) Open(watcher *Filter) (msg *ReceivedMessage) {
 	}
 
 	if msg != nil {
-		ok := msg.Validate()
+		ok := msg.ValidateAndParse()
 		if !ok {
 			return nil
 		}
@@ -240,7 +254,7 @@ func (e *Envelope) Bloom() []byte {
 
 // TopicToBloom converts the topic (4 bytes) to the bloom filter (64 bytes)
 func TopicToBloom(topic TopicType) []byte {
-	b := make([]byte, bloomFilterSize)
+	b := make([]byte, BloomFilterSize)
 	var index [3]int
 	for j := 0; j < 3; j++ {
 		index[j] = int(topic[j])
@@ -255,4 +269,12 @@ func TopicToBloom(topic TopicType) []byte {
 		b[byteIndex] = (1 << uint(bitIndex))
 	}
 	return b
+}
+
+// GetEnvelope retrieves an envelope from the message queue by its hash.
+// It returns nil if the envelope can not be found.
+func (w *Whisper) GetEnvelope(hash common.Hash) *Envelope {
+	w.poolMu.RLock()
+	defer w.poolMu.RUnlock()
+	return w.envelopes[hash]
 }

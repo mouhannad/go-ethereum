@@ -17,13 +17,15 @@
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
 import React, {Component} from 'react';
+import {hot} from 'react-hot-loader';
 
-import withStyles from 'material-ui/styles/withStyles';
+import withStyles from '@material-ui/core/styles/withStyles';
 
-import Header from './Header';
-import Body from './Body';
-import Footer from './Footer';
-import {MENU} from './Common';
+import Header from 'Header';
+import Body from 'Body';
+import {inserter as logInserter, SAME} from 'Logs';
+import {inserter as peerInserter} from 'Network';
+import {MENU} from '../common';
 import type {Content} from '../types/content';
 
 // deepUpdate updates an object corresponding to the given update data, which has
@@ -35,17 +37,16 @@ import type {Content} from '../types/content';
 // the generalization of the message handling. The only necessary thing is to set a
 // handler function for every path of the state in order to maximize the flexibility
 // of the update.
-const deepUpdate = (prev: Object, update: Object, updater: Object) => {
+const deepUpdate = (updater: Object, update: Object, prev: Object): $Shape<Content> => {
 	if (typeof update === 'undefined') {
-		// TODO (kurkomisi): originally this was deep copy, investigate it.
 		return prev;
 	}
 	if (typeof updater === 'function') {
-		return updater(prev, update);
+		return updater(update, prev);
 	}
 	const updated = {};
 	Object.keys(prev).forEach((key) => {
-		updated[key] = deepUpdate(prev[key], update[key], updater[key]);
+		updated[key] = deepUpdate(updater[key], update[key], prev[key]);
 	});
 
 	return updated;
@@ -56,83 +57,117 @@ const deepUpdate = (prev: Object, update: Object, updater: Object) => {
 // whether the involved data was changed or not by checking the message structure.
 //
 // We could return the message itself too, but it's safer not to give access to it.
-const shouldUpdate = (msg: Object, updater: Object) => {
+const shouldUpdate = (updater: Object, msg: Object) => {
 	const su = {};
 	Object.keys(msg).forEach((key) => {
-		su[key] = typeof updater[key] !== 'function' ? shouldUpdate(msg[key], updater[key]) : true;
+		su[key] = typeof updater[key] !== 'function' ? shouldUpdate(updater[key], msg[key]) : true;
 	});
 
 	return su;
 };
 
-// appender is a state update generalization function, which appends the update data
-// to the existing data. limit defines the maximum allowed size of the created array.
-const appender = <T>(limit: number) => (prev: Array<T>, update: Array<T>) => [...prev, ...update].slice(-limit);
+// replacer is a state updater function, which replaces the original data.
+const replacer = <T>(update: T) => update;
 
-// replacer is a state update generalization function, which replaces the original data.
-const replacer = <T>(prev: T, update: T) => update;
+// appender is a state updater function, which appends the update data to the
+// existing data. limit defines the maximum allowed size of the created array,
+// mapper maps the update data.
+const appender = <T>(limit: number, mapper = replacer) => (update: Array<T>, prev: Array<T>) => [
+	...prev,
+	...update.map(sample => mapper(sample)),
+].slice(-limit);
 
-// defaultContent is the initial value of the state content.
-const defaultContent: Content = {
+// defaultContent returns the initial value of the state content. Needs to be a function in order to
+// instantiate the object again, because it is used by the state, and isn't automatically cleaned
+// when a new connection is established. The state is mutated during the update in order to avoid
+// the execution of unnecessary operations (e.g. copy of the log array).
+const defaultContent: () => Content = () => ({
 	general: {
 		version: null,
 		commit:  null,
 	},
-	home: {
-		memory:  [],
-		traffic: [],
-	},
+	home:    {},
 	chain:   {},
 	txpool:  {},
-	network: {},
-	system:  {},
-	logs:    {
-		log: [],
+	network: {
+		peers: {
+			bundles: {},
+		},
+		diff: [],
 	},
-};
+	system: {
+		activeMemory:   [],
+		virtualMemory:  [],
+		networkIngress: [],
+		networkEgress:  [],
+		processCPU:     [],
+		systemCPU:      [],
+		diskRead:       [],
+		diskWrite:      [],
+	},
+	logs: {
+		chunks:        [],
+		endTop:        false,
+		endBottom:     true,
+		topChanged:    SAME,
+		bottomChanged: SAME,
+	},
+});
 
-// updaters contains the state update generalization functions for each path of the state.
-// TODO (kurkomisi): Define a tricky type which embraces the content and the handlers.
+// updaters contains the state updater functions for each path of the state.
+//
+// TODO (kurkomisi): Define a tricky type which embraces the content and the updaters.
 const updaters = {
 	general: {
 		version: replacer,
 		commit:  replacer,
 	},
-	home: {
-		memory:  appender(200),
-		traffic: appender(200),
-	},
+	home:    null,
 	chain:   null,
 	txpool:  null,
-	network: null,
-	system:  null,
-	logs:    {
-		log: appender(200),
+	network: peerInserter(200),
+	system:  {
+		activeMemory:   appender(200),
+		virtualMemory:  appender(200),
+		networkIngress: appender(200),
+		networkEgress:  appender(200),
+		processCPU:     appender(200),
+		systemCPU:      appender(200),
+		diskRead:       appender(200),
+		diskWrite:      appender(200),
+	},
+	logs: logInserter(5),
+};
+
+// styles contains the constant styles of the component.
+const styles = {
+	dashboard: {
+		display:  'flex',
+		flexFlow: 'column',
+		width:    '100%',
+		height:   '100%',
+		zIndex:   1,
+		overflow: 'hidden',
 	},
 };
 
-// styles returns the styles for the Dashboard component.
-const styles = theme => ({
+// themeStyles returns the styles generated from the theme for the component.
+const themeStyles: Object = (theme: Object) => ({
 	dashboard: {
-		display:    'flex',
-		flexFlow:   'column',
-		width:      '100%',
-		height:     '100%',
 		background: theme.palette.background.default,
-		zIndex:     1,
-		overflow:   'hidden',
 	},
 });
 
 export type Props = {
-	classes: Object,
+	classes: Object, // injected by withStyles()
 };
 
 type State = {
-	active: string, // active menu
-	sideBar: boolean, // true if the sidebar is opened
-	content: Content, // the visualized data
-	shouldUpdate: Object // labels for the components, which need to rerender based on the incoming message
+	active:       string,  // active menu
+	sideBar:      boolean, // true if the sidebar is opened
+	content:      Content, // the visualized data
+	shouldUpdate: Object,  // labels for the components, which need to re-render based on the incoming message
+	server:       ?WebSocket,
 };
 
 // Dashboard is the main component, which renders the whole page, makes connection with the server and
@@ -143,8 +178,9 @@ class Dashboard extends Component<Props, State> {
 		this.state = {
 			active:       MENU.get('home').id,
 			sideBar:      true,
-			content:      defaultContent,
+			content:      defaultContent(),
 			shouldUpdate: {},
+			server:       null,
 		};
 	}
 
@@ -156,9 +192,10 @@ class Dashboard extends Component<Props, State> {
 	// reconnect establishes a websocket connection with the server, listens for incoming messages
 	// and tries to reconnect on connection loss.
 	reconnect = () => {
-		const server = new WebSocket(`${((window.location.protocol === 'https:') ? 'wss://' : 'ws://') + window.location.host}/api`);
+		const host = process.env.NODE_ENV === 'production' ? window.location.host : 'localhost:8080';
+		const server = new WebSocket(`${((window.location.protocol === 'https:') ? 'wss://' : 'ws://')}${host}/api`);
 		server.onopen = () => {
-			this.setState({content: defaultContent, shouldUpdate: {}});
+			this.setState({content: defaultContent(), shouldUpdate: {}, server});
 		};
 		server.onmessage = (event) => {
 			const msg: $Shape<Content> = JSON.parse(event.data);
@@ -169,15 +206,23 @@ class Dashboard extends Component<Props, State> {
 			this.update(msg);
 		};
 		server.onclose = () => {
+			this.setState({server: null});
 			setTimeout(this.reconnect, 3000);
 		};
+	};
+
+	// send sends a message to the server, which can be accessed only through this function for safety reasons.
+	send = (msg: string) => {
+		if (this.state.server != null) {
+			this.state.server.send(msg);
+		}
 	};
 
 	// update updates the content corresponding to the incoming message.
 	update = (msg: $Shape<Content>) => {
 		this.setState(prevState => ({
-			content:      deepUpdate(prevState.content, msg, updaters),
-			shouldUpdate: shouldUpdate(msg, updaters),
+			content:      deepUpdate(updaters, msg, prevState.content),
+			shouldUpdate: shouldUpdate(updaters, msg),
 		}));
 	};
 
@@ -186,25 +231,16 @@ class Dashboard extends Component<Props, State> {
 		this.setState(prevState => (prevState.active !== newActive ? {active: newActive} : {}));
 	};
 
-	// openSideBar opens the sidebar.
-	openSideBar = () => {
-		this.setState({sideBar: true});
-	};
-
-	// closeSideBar closes the sidebar.
-	closeSideBar = () => {
-		this.setState({sideBar: false});
+	// switchSideBar opens or closes the sidebar's state.
+	switchSideBar = () => {
+		this.setState(prevState => ({sideBar: !prevState.sideBar}));
 	};
 
 	render() {
-		const {classes} = this.props; // The classes property is injected by withStyles().
-
 		return (
-			<div className={classes.dashboard}>
+			<div className={this.props.classes.dashboard} style={styles.dashboard}>
 				<Header
-					opened={this.state.sideBar}
-					openSideBar={this.openSideBar}
-					closeSideBar={this.closeSideBar}
+					switchSideBar={this.switchSideBar}
 				/>
 				<Body
 					opened={this.state.sideBar}
@@ -212,17 +248,11 @@ class Dashboard extends Component<Props, State> {
 					active={this.state.active}
 					content={this.state.content}
 					shouldUpdate={this.state.shouldUpdate}
-				/>
-				<Footer
-					opened={this.state.sideBar}
-					openSideBar={this.openSideBar}
-					closeSideBar={this.closeSideBar}
-					general={this.state.content.general}
-					shouldUpdate={this.state.shouldUpdate}
+					send={this.send}
 				/>
 			</div>
 		);
 	}
 }
 
-export default withStyles(styles)(Dashboard);
+export default hot(module)(withStyles(themeStyles)(Dashboard));
